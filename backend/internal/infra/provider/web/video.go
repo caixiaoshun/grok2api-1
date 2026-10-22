@@ -16,8 +16,10 @@ import (
 
 	"github.com/chenyme/grok2api/backend/internal/domain/account"
 	domainegress "github.com/chenyme/grok2api/backend/internal/domain/egress"
+	mediadomain "github.com/chenyme/grok2api/backend/internal/domain/media"
 	settingsdomain "github.com/chenyme/grok2api/backend/internal/domain/settings"
 	"github.com/chenyme/grok2api/backend/internal/infra/provider"
+	"github.com/chenyme/grok2api/backend/internal/infra/egress"
 )
 
 type webMediaUpstreamError struct {
@@ -251,8 +253,8 @@ func boundWebMediaDiagnostic(value string, limit int) string {
 }
 
 func (a *Adapter) GenerateVideo(ctx context.Context, request provider.VideoRequest) (provider.VideoResult, error) {
-	if strings.TrimSpace(request.ImageURL) != "" || len(request.ReferenceURLs) > 0 {
-		return provider.VideoResult{}, provider.WrapVideoStage(provider.VideoStagePrepare, 0, fmt.Errorf("Grok Web 当前仅支持文本生视频；图片视频请使用 Build 或 Console Provider"))
+	if len(request.ReferenceAudios) > 0 {
+		return provider.VideoResult{}, provider.WrapVideoStage(provider.VideoStagePrepare, 0, fmt.Errorf("Grok Web 暂不支持参考音频视频；参考音频请使用 Console Provider"))
 	}
 	cfg := a.config()
 	token, err := a.cipher.Decrypt(request.Credential.EncryptedAccessToken)
@@ -264,6 +266,10 @@ func (a *Adapter) GenerateVideo(ctx context.Context, request provider.VideoReque
 		return provider.VideoResult{}, provider.WrapVideoStage(provider.VideoStagePrepare, 0, err)
 	}
 	defer lease.Release()
+	assetIDs, prepErr := a.uploadVideoReferences(ctx, cfg, lease, token, request)
+	if prepErr != nil {
+		return provider.VideoResult{}, provider.WrapVideoStage(provider.VideoStagePrepare, 0, prepErr)
+	}
 	if len(videoSegments(request.Duration)) == 0 {
 		return provider.VideoResult{}, provider.WrapVideoStage(provider.VideoStagePrepare, 0, fmt.Errorf("duration 必须在 1 到 15 秒之间"))
 	}
@@ -274,8 +280,20 @@ func (a *Adapter) GenerateVideo(ctx context.Context, request provider.VideoReque
 	if resolution == "" {
 		resolution = "720p"
 	}
-	payload := videoCreatePayload(request.Prompt, ratio, resolution, segments[0])
-	response, err := a.postJSON(ctx, cfg, lease, token, cfg.BaseURL+"/rest/app-chat/conversations/new", payload, time.Duration(cfg.VideoTimeoutSeconds)*time.Second)
+	var payload map[string]any
+	referer := ""
+	if len(assetIDs) > 0 {
+		payload = videoCreateImagePayload(request.Prompt, assetIDs, ratio, resolution, segments[0])
+		referer = cfg.BaseURL + "/imagine"
+	} else {
+		payload = videoCreatePayload(request.Prompt, ratio, resolution, segments[0])
+	}
+	var response *http.Response
+	if referer != "" {
+		response, err = a.postJSONWithReferer(ctx, cfg, lease, token, cfg.BaseURL+"/rest/app-chat/conversations/new", payload, time.Duration(cfg.VideoTimeoutSeconds)*time.Second, referer)
+	} else {
+		response, err = a.postJSON(ctx, cfg, lease, token, cfg.BaseURL+"/rest/app-chat/conversations/new", payload, time.Duration(cfg.VideoTimeoutSeconds)*time.Second)
+	}
 	if err != nil {
 		return provider.VideoResult{}, provider.WrapVideoStage(provider.VideoCreateFailureStage(err), 0, err)
 	}
@@ -566,4 +584,76 @@ func videoCreatePayload(prompt, ratio, resolution string, seconds int) map[strin
 		},
 		"kind": "CONVERSATION_KIND_IMAGINE",
 	}
+}
+
+// videoCreateImagePayload 镜像浏览器 Imagine 的 image-to-video 请求结构：
+// upload-file-v2 返回的 fileMetadataId 直接进入 imageToVideo.inputAssets，
+// 不再创建 media post（旧协议）。
+func videoCreateImagePayload(prompt string, assetIDs []string, ratio, resolution string, seconds int) map[string]any {
+	return map[string]any{
+		"modelName":            "imagine-video-gen",
+		"message":              prompt + " --mode=custom",
+		"enableImageStreaming": true,
+		"enableSideBySide":     true,
+		"sendFinalMetadata":    true,
+		"responseMetadata": map[string]any{
+			"experiments": []any{},
+			"modelConfigOverride": map[string]any{
+				"modelMap": map[string]any{},
+			},
+		},
+		"mediaGenInput": map[string]any{
+			"imageToVideo": map[string]any{
+				"prompt":         prompt,
+				"inputAssets":    assetIDs,
+				"aspectRatio":    ratio,
+				"duration":       seconds,
+				"resolutionName": resolution,
+				"mode":           "custom",
+			},
+		},
+		"kind": "CONVERSATION_KIND_IMAGINE",
+	}
+}
+
+// videoReferenceInputs 归并首帧 image 与 reference_images（两者互斥）。
+func videoReferenceInputs(request provider.VideoRequest) []string {
+	refs := make([]string, 0, len(request.ReferenceURLs)+1)
+	if raw := strings.TrimSpace(request.ImageURL); raw != "" {
+		refs = append(refs, raw)
+	}
+	for _, raw := range request.ReferenceURLs {
+		if trimmed := strings.TrimSpace(raw); trimmed != "" {
+			refs = append(refs, trimmed)
+		}
+	}
+	return refs
+}
+
+// uploadVideoReferences 在同一账号与出口租约内完成参考图解析与 V2 直传，
+// 返回上游认可的 fileMetadataId 列表（ Imagine imageToVideo.inputAssets）。
+func (a *Adapter) uploadVideoReferences(ctx context.Context, cfg Config, lease *egress.Lease, token string, request provider.VideoRequest) ([]string, error) {
+	refs := videoReferenceInputs(request)
+	if len(refs) == 0 {
+		return nil, nil
+	}
+	if len(refs) > mediadomain.MaxInputImages {
+		return nil, fmt.Errorf("视频参考图最多 %d 张，当前为 %d 张", mediadomain.MaxInputImages, len(refs))
+	}
+	assetIDs := make([]string, 0, len(refs))
+	for _, raw := range refs {
+		image, loadErr := a.loadChatImage(ctx, lease, raw, cfg.MaxInputImageBytes)
+		if loadErr != nil {
+			return nil, loadErr
+		}
+		uploaded, uploadErr := a.uploadFileV2Direct(ctx, cfg, lease, token, image, cfg.BaseURL+"/imagine", imagineSelfUploadSource, "video_i2v_upload")
+		if uploadErr != nil {
+			return nil, uploadErr
+		}
+		if uploaded.MetadataID == "" {
+			return nil, fmt.Errorf("上传视频参考图成功但上游未返回 fileMetadataId")
+		}
+		assetIDs = append(assetIDs, uploaded.MetadataID)
+	}
+	return assetIDs, nil
 }

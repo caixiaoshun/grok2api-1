@@ -142,6 +142,17 @@ func (s *Service) CreateVideo(ctx context.Context, input VideoInput) (media.Job,
 	if err != nil {
 		return media.Job{}, err
 	}
+	if len(input.ReferenceAudios) > 0 {
+		// Web 平面暂不支持参考音频视频，避免选中后在适配器层必然失败。
+		audioRoutes := make([]model.Route, 0, len(routes))
+		for _, candidate := range routes {
+			if candidate.Provider == account.ProviderWeb {
+				continue
+			}
+			audioRoutes = append(audioRoutes, candidate)
+		}
+		routes = audioRoutes
+	}
 	allRefs := videoInputReferences(input.ImageURL, input.ReferenceURLs)
 	if err := s.validateVideoInputReferences(ctx, allRefs, "image"); err != nil {
 		return media.Job{}, err
@@ -239,9 +250,10 @@ func validateVideoRouteParameters(providerValue account.Provider, operation prov
 	}
 	trimmedModel := strings.TrimSpace(upstreamModel)
 	hasReferences := referenceCount > 0
-	if providerValue == account.ProviderWeb && (hasImage || hasReferences) {
-		return fmt.Errorf("%w: Grok Web 当前仅支持文本生视频；图片视频请使用 Build 或 Console Provider", ErrVideoOperationUnsupported)
-	}
+	// 2026-10-21 本地补丁：Grok Web 支持 image-to-video / 参考图视频。
+	// 适配器按浏览器同构协议上传（upload-file-v2 → fileMetadataId →
+	// mediaGenInput.imageToVideo.inputAssets），上游失败仍走既有 stage/账务/冷却兜底。
+	// 参考音频（R2V）仍仅限 Console/Build。
 	if providerValue == account.ProviderConsole && (trimmedModel == "grok-imagine-video" || trimmedModel == "grok-imagine-video-1.5") {
 		// 实测：8 张 reference_images 上游回 400
 		// "Too many reference images: 8. Maximum allowed is 7."（两个视频模型一致）。

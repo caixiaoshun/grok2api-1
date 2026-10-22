@@ -209,10 +209,11 @@ func TestVideoRouteParametersRejectConsoleReferenceLimits(t *testing.T) {
 	if err := validateVideoRouteParameters(account.ProviderWeb, provider.VideoOperationGenerate, "grok-imagine-video", "720p", false, 0, 15); err != nil {
 		t.Fatalf("Web text video error = %v", err)
 	}
-	if err := validateVideoRouteParameters(account.ProviderWeb, provider.VideoOperationGenerate, "grok-imagine-video", "720p", true, 0, 6); !errors.Is(err, ErrVideoOperationUnsupported) {
+	// 2026-10-21 本地补丁：Web 支持 image/reference 视频（浏览器同构 imageToVideo 协议）。
+	if err := validateVideoRouteParameters(account.ProviderWeb, provider.VideoOperationGenerate, "grok-imagine-video", "720p", true, 0, 6); err != nil {
 		t.Fatalf("Web image video error = %v", err)
 	}
-	if err := validateVideoRouteParameters(account.ProviderWeb, provider.VideoOperationGenerate, "grok-imagine-video", "720p", false, 1, 6); !errors.Is(err, ErrVideoOperationUnsupported) {
+	if err := validateVideoRouteParameters(account.ProviderWeb, provider.VideoOperationGenerate, "grok-imagine-video", "720p", false, 1, 6); err != nil {
 		t.Fatalf("Web reference video error = %v", err)
 	}
 }
